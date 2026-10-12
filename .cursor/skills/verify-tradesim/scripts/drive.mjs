@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Drive a verification TradeSim instance through system Chrome's DevTools port.
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 function assertChromeCanLaunch() {
   // Seatbelt denies the WindowServer mach lookup. Chrome then aborts in
@@ -30,6 +31,32 @@ function chromeBinary() {
   return found;
 }
 const STATE_DIR = process.env.TRADESIM_VERIFY_STATE_DIR || "/tmp/tradesim-verify";
+const ARTIFACTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..", "artifacts");
+
+function validPort(value) {
+  const text = String(value);
+  const number = Number(text);
+  return /^[0-9]{4,5}$/.test(text) && number >= 1024 && number <= 55535 && number !== 3000;
+}
+
+function safeOutPath(value) {
+  if (typeof value !== "string") throw new Error("--out requires a file path");
+  const target = resolve(value);
+  if (!target.startsWith(ARTIFACTS_DIR + sep)) {
+    throw new Error("--out must be inside " + ARTIFACTS_DIR);
+  }
+  return target;
+}
+
+function isOurChrome(pid, cdpPort) {
+  if (!Number.isInteger(pid) || pid <= 1 || !/^[0-9]+$/.test(String(cdpPort))) return false;
+  try {
+    const command = execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+    return command.includes("--remote-debugging-port=" + cdpPort);
+  } catch {
+    return false;
+  }
+}
 
 function usage() {
   console.log(`Usage: drive.mjs --port PORT <command>
@@ -66,7 +93,7 @@ function parseArgs(argv) {
 }
 
 function statePath(port) {
-  return `${STATE_DIR}/browser-${port}.env`;
+  return `${STATE_DIR}/browser-${port}.state`;
 }
 
 async function readState(port) {
@@ -84,7 +111,7 @@ async function writeState(port, state) {
   const body = Object.entries(state)
     .map(([key, value]) => `${key}=${value}`)
     .join("\n");
-  await writeFile(statePath(port), `${body}\n`);
+  await writeFile(statePath(port), body + "\n", { mode: 0o600 });
 }
 
 function sleep(ms) {
@@ -221,9 +248,10 @@ const FIND_SCRIPT = `async (request) => {
 
 async function connect(port) {
   const state = await readState(port);
-  const list = await fetch(`http://127.0.0.1:${state.CDP_PORT}/json/list`).then((response) =>
-    response.json()
-  );
+  if (!/^[0-9]+$/.test(String(state.CDP_PORT))) throw new Error("Invalid CDP port in state file");
+  const listUrl = "http://127.0.0.1:" + state.CDP_PORT + "/json/list";
+  const listResponse = await fetch(listUrl);
+  const list = await listResponse.json();
   const page = list.find((target) => target.type === "page");
   if (!page) throw new Error("Chrome has no page target");
   const ws = new WebSocket(page.webSocketDebuggerUrl);
@@ -241,13 +269,17 @@ async function start(port) {
   assertChromeCanLaunch();
   const cdpPort = String(10000 + Number(port));
   const userDataDir = `${STATE_DIR}/chrome-${port}`;
-  await mkdir(userDataDir, { recursive: true });
+  await mkdir(STATE_DIR, { recursive: true, mode: 0o700 });
+  await mkdir(userDataDir, { recursive: true, mode: 0o700 });
   const chrome = spawn(
     chromeBinary(),
     [
       "--headless=new",
       "--disable-gpu",
       "--disable-dev-shm-usage",
+      "--remote-debugging-address=127.0.0.1",
+      "--no-first-run",
+      "--disable-extensions",
       `--remote-debugging-port=${cdpPort}`,
       `--user-data-dir=${userDataDir}`,
       "about:blank",
@@ -262,7 +294,7 @@ async function start(port) {
     CHROME_PID: String(chrome.pid),
     PGID: String(chrome.pid),
   });
-  console.log(`CHROME_PID=${chrome.pid}`);
+  console.log("CHROME_PID=" + chrome.pid);
   console.log(`CDP_PORT=${cdpPort}`);
 }
 
@@ -273,8 +305,15 @@ async function stop(port) {
   } catch {
     state = {};
   }
-  const pid = Number(state.CHROME_PID);
-  const pgid = Number(state.PGID || state.CHROME_PID);
+  let pid = Number(state.CHROME_PID);
+  let pgid = Number(state.PGID || state.CHROME_PID);
+  if (!isOurChrome(pid, state.CDP_PORT)) {
+    if (pid || pgid) {
+      console.error("Chrome pid " + state.CHROME_PID + " is not running or is not the verification Chrome. Skipping kill.");
+    }
+    pid = 0;
+    pgid = 0;
+  }
   if (pgid) {
     try {
       process.kill(-pgid, "SIGTERM");
@@ -316,6 +355,10 @@ async function main() {
     usage();
     process.exit(1);
   }
+  if (!validPort(port)) {
+    console.error("--port must be a number from 1024 to 55535 (not 3000)");
+    process.exit(1);
+  }
 
   if (command === "start") {
     await start(port);
@@ -340,6 +383,10 @@ async function main() {
         name: args.name,
       });
       if (result?.action === "navigate" && result.href) {
+        const origin = "http://127.0.0.1:" + port;
+        if (new URL(result.href, origin).origin !== origin) {
+          throw new Error("Refusing to navigate away from the verification origin: " + result.href);
+        }
         await session.send("Page.navigate", { url: result.href });
         await waitForLoad(session, result.href);
       }
@@ -367,6 +414,7 @@ async function main() {
       if (!found) throw new Error(`Timed out waiting for ${text}`);
       console.log(`saw ${text}`);
     } else if (command === "snapshot") {
+      const out = safeOutPath(args.out);
       await session.send("Accessibility.enable");
       const tree = await session.send("Accessibility.getFullAXTree");
       const nodes = new Map(tree.nodes.map((node) => [node.nodeId, node]));
@@ -388,17 +436,18 @@ async function main() {
       };
       const root = tree.nodes.find((node) => !node.parentId) || tree.nodes[0];
       if (root) visit(root.nodeId, 0);
-      await mkdir(dirname(args.out), { recursive: true });
-      await writeFile(args.out, `${lines.join("\n")}\n`);
-      console.log(args.out);
+      await mkdir(dirname(out), { recursive: true });
+      await writeFile(out, lines.join("\n") + "\n");
+      console.log(out);
     } else if (command === "screenshot") {
+      const out = safeOutPath(args.out);
       const shot = await session.send("Page.captureScreenshot", {
         format: "png",
         captureBeyondViewport: true,
       });
-      await mkdir(dirname(args.out), { recursive: true });
-      await writeFile(args.out, Buffer.from(shot.data, "base64"));
-      console.log(args.out);
+      await mkdir(dirname(out), { recursive: true });
+      await writeFile(out, Buffer.from(shot.data, "base64"));
+      console.log(out);
     } else {
       usage();
       process.exit(1);

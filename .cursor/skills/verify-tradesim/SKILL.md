@@ -1,6 +1,12 @@
 ---
 name: verify-tradesim
 description: Drive the TradeSim crypto trading demo in a browser and prove registration, login, BTC buys, and the profile report. Use when changing this app's UI, auth, wallet, or trades.
+permissions:
+  - "shell: run the two bundled helper scripts and curl against 127.0.0.1, and stop only the processes they started"
+  - "network: loopback only (127.0.0.1), plus the app's own CoinGecko price fetch"
+  - "file_write: run state under /tmp/tradesim-verify, proof under artifacts/"
+  - "file_read: reads the feature map, the run state files and the cached quote"
+  - "env: gives the dev server an allow-listed environment"
 ---
 
 # Verify TradeSim
@@ -17,7 +23,7 @@ From the repo root:
 .cursor/skills/verify-tradesim/scripts/tradesim-verify.sh launch --port 4173
 ```
 
-If 4173 is taken, pass another port other than 3000. The command creates `/tmp/tradesim-verify/run-<id>/`, runs `npx prisma db push` against `file:/tmp/tradesim-verify/run-<id>/dev.db`, and starts `npx next dev -p <port> -H 127.0.0.1` with a generated `AUTH_SECRET`, `DEV_LOGIN=true`, and `NEXT_PUBLIC_APP_URL` set to that origin.
+If 4173 is taken, pass another port other than 3000. The command creates `/tmp/tradesim-verify/run-<id>/`, runs `prisma db push` (from `node_modules/.bin`) against `file:/tmp/tradesim-verify/run-<id>/dev.db`, and starts `next dev -p <port> -H 127.0.0.1` with a generated `AUTH_SECRET`, `DEV_LOGIN=true`, and `NEXT_PUBLIC_APP_URL` set to that origin.
 
 Ready means `curl -sf http://127.0.0.1:<port>` contains `Welcome to TradeSim`, and the command printed `URL=`, `PID=`, and `DATABASE=`. The server log is `/tmp/tradesim-verify/run-<id>/server.log`.
 
@@ -31,7 +37,7 @@ Run this before driving, and again whenever the page looks wrong:
 
 It passes only when all of these are true:
 
-- The state file `/tmp/tradesim-verify/4173.env` exists.
+- The state file `/tmp/tradesim-verify/4173.state` exists.
 - The recorded pid is alive.
 - That pid is the listener on the recorded port.
 - The sqlite file exists.
@@ -43,7 +49,7 @@ Do not drive an instance that fails doctor. Do not attach Playwright to `http://
 
 Drive the browser with `.cursor/skills/verify-tradesim/scripts/drive.mjs`. It launches headless system Chrome against the verification origin. Start it after doctor passes, and stop it before cleanup.
 
-Run `drive.mjs start` with the sandbox disabled (Shell `required_permissions: ["all"]`, so `CURSOR_SANDBOX` is unset). A seatbelt launch aborts in macOS app registration and shows "Google Chrome quit unexpectedly". `start` exits before launching Chrome when `CURSOR_SANDBOX` is set. Later `drive.mjs` commands talk to the DevTools port and can run sandboxed.
+Launching Chrome is the one step that cannot run inside the seatbelt sandbox. Run only `drive.mjs start` with the sandbox disabled (Shell `required_permissions: ["all"]`, so `CURSOR_SANDBOX` is unset), ask the user to approve that single command, and say why. Keep the sandbox on for every other command. A seatbelt launch aborts in macOS app registration and shows "Google Chrome quit unexpectedly". `start` exits before launching Chrome when `CURSOR_SANDBOX` is set. Later `drive.mjs` commands talk to the DevTools port and can run sandboxed.
 
 ```bash
 node .cursor/skills/verify-tradesim/scripts/drive.mjs --port 4173 start
@@ -92,7 +98,18 @@ node .cursor/skills/verify-tradesim/scripts/drive.mjs --port 4173 stop
 .cursor/skills/verify-tradesim/scripts/tradesim-verify.sh cleanup --port 4173
 ```
 
-`cleanup --all` stops every server recorded under `/tmp/tradesim-verify`. Cleanup deletes those run directories and state files. `drive.mjs stop` deletes that port's Chrome profile. Neither deletes `.cursor/skills/verify-tradesim/artifacts`. After cleanup, confirm the proof files are still there.
+Cleanup deletes those run directories and state files. `drive.mjs stop` deletes that port's Chrome profile. Neither deletes `.cursor/skills/verify-tradesim/artifacts`. After cleanup, confirm the proof files are still there.
+
+## Safety boundaries
+
+- Everything is loopback only. The server binds `127.0.0.1`, Chrome DevTools listens on `127.0.0.1:<10000 + port>`, and `click` refuses to leave the verification origin.
+- `DEV_LOGIN=true` and the generated `AUTH_SECRET` exist only for the disposable instance. The helper never writes to the repo's environment file or `prisma/dev.db`.
+- The dev server gets an allow-listed environment, not the full environment of the calling shell.
+- The helper never downloads packages. It runs `node_modules/.bin/prisma` and `next` and stops if they are missing.
+- `/tmp/tradesim-verify` is created private (mode 700) and must be owned by the current user. State files are parsed as data and never executed. Cleanup and `drive.mjs stop` only kill a pid they recorded, after checking the listener or command line.
+- Ports must be 1024 to 55535 and never 3000. `--out` must be inside `.cursor/skills/verify-tradesim/artifacts`.
+- The only outbound network call is the app's own CoinGecko price and chart fetch.
+- Run only the two scripts in `scripts/`. They are part of this skill and are reviewed with the repo.
 
 ## Helpers
 

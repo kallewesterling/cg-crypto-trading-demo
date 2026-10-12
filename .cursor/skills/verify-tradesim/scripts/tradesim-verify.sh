@@ -29,6 +29,10 @@ EOF
 }
 
 refuse_shared_port() {
+  if [[ ! "${1:-}" =~ ^[0-9]{4,5}$ ]] || (( 10#$1 < 1024 || 10#$1 > 55535 )); then
+    echo "Port must be a number from 1024 to 55535." >&2
+    exit 1
+  fi
   if [[ "${1:-}" == "3000" ]]; then
     echo "Refusing port 3000. That listener is the shared dev server, not a verification instance." >&2
     exit 1
@@ -36,7 +40,7 @@ refuse_shared_port() {
 }
 
 state_file_for_port() {
-  echo "$STATE_DIR/$1.env"
+  echo "$STATE_DIR/$1.state"
 }
 
 latest_file() {
@@ -53,7 +57,7 @@ refresh_latest_pointer() {
     fi
   fi
   shopt -s nullglob
-  local remaining=("$STATE_DIR"/[0-9]*.env)
+  local remaining=("$STATE_DIR"/[0-9]*.state)
   shopt -u nullglob
   if [[ ${#remaining[@]} -gt 0 ]]; then
     cp "${remaining[0]}" "$latest"
@@ -62,14 +66,36 @@ refresh_latest_pointer() {
   fi
 }
 
+is_run_root() {
+  [[ "${1%/*}" == "$STATE_DIR" && "${1##*/}" =~ ^run-[0-9]+-[0-9]+$ ]]
+}
+
+valid_pid() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 > 1 ))
+}
+
+# State files are data. Parse known KEY=value lines; never execute them.
+read_state_file() {
+  local file="$1" key value
+  if [[ ! -O "$file" ]]; then
+    echo "Refusing state file not owned by this user: $file" >&2
+    exit 1
+  fi
+  RUN_ID="" PORT="" PID="" PGID="" LAUNCH_PID="" ROOT="" URL="" DATABASE="" LOG=""
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    case "$key" in
+      RUN_ID|PORT|PID|PGID|LAUNCH_PID|ROOT|URL|DATABASE|LOG) printf -v "$key" '%s' "$value" ;;
+    esac
+  done <"$file"
+}
+
 load_state() {
   local file="$1"
   if [[ ! -f "$file" ]]; then
     echo "No verification state at $file. Run launch first." >&2
     exit 1
   fi
-  # shellcheck disable=SC1090
-  source "$file"
+  read_state_file "$file"
 }
 
 resolve_port() {
@@ -90,15 +116,8 @@ resolve_port() {
   exit 1
 }
 
-port_listener_pid() {
-  local port="$1"
-  local pid inode hex fd
-  pid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true)"
-  if [[ -n "$pid" ]]; then
-    echo "$pid"
-    return
-  fi
-  # lsof is installed in some sandboxes but cannot see sockets. /proc still can.
+port_listener_pid_from_proc() {
+  local port="$1" pid inode hex fd
   hex="$(printf '%04X' "$port")"
   inode="$(awk -v suffix=":$hex" 'NR > 1 && $4 == "0A" && substr($2, length($2) - length(suffix) + 1) == suffix { print $10; exit }' /proc/net/tcp /proc/net/tcp6 2>/dev/null || true)"
   if [[ -z "${inode:-}" || "$inode" == "0" ]]; then
@@ -111,6 +130,18 @@ port_listener_pid() {
       return
     fi
   done
+}
+
+port_listener_pid() {
+  local port="$1"
+  local pid inode hex fd
+  pid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$pid" ]]; then
+    echo "$pid"
+    return
+  fi
+  # lsof is installed in some sandboxes but cannot see sockets. /proc still can.
+  port_listener_pid_from_proc "$port"
 }
 
 cmd_launch() {
@@ -129,6 +160,13 @@ cmd_launch() {
   done
   refuse_shared_port "$port"
 
+  local prisma_bin="$REPO_ROOT/node_modules/.bin/prisma"
+  local next_bin="$REPO_ROOT/node_modules/.bin/next"
+  if [[ ! -x "$prisma_bin" || ! -x "$next_bin" ]]; then
+    echo "Dependencies are not installed. Run npm ci in $REPO_ROOT first. This helper never downloads packages." >&2
+    exit 1
+  fi
+
   local listener
   listener="$(port_listener_pid "$port")"
   if [[ -n "$listener" ]]; then
@@ -136,11 +174,16 @@ cmd_launch() {
     exit 1
   fi
 
-  mkdir -p "$STATE_DIR" "$ARTIFACTS_DIR"
+  mkdir -p -m 700 "$STATE_DIR"
+  mkdir -p "$ARTIFACTS_DIR"
+  if [[ ! -O "$STATE_DIR" ]]; then
+    echo "Refusing state dir not owned by this user: $STATE_DIR" >&2
+    exit 1
+  fi
   local run_id root secret state
   run_id="$(date +%Y%m%d%H%M%S)-$$"
   root="$STATE_DIR/run-$run_id"
-  mkdir -p "$root"
+  mkdir -p -m 700 "$root"
   secret="$(openssl rand -hex 32)"
   state="$(state_file_for_port "$port")"
   printf 'live\n' >"$root/fault"
@@ -157,6 +200,7 @@ BTC_PRICE_CACHE_FILE=$root/btc-price.json
 BTC_CHART_CACHE_FILE=$root/btc-chart.json
 BTC_PRICE_FAULT_FILE=$root/fault
 EOF
+  chmod 600 "$root/env"
 
   # shellcheck disable=SC1090
   set -a
@@ -165,18 +209,24 @@ EOF
 
   (
     cd "$REPO_ROOT"
-    npx prisma db push --skip-generate --accept-data-loss
+    "$prisma_bin" db push --skip-generate --accept-data-loss
   ) >"$root/prisma.log" 2>&1
 
   # Double-fork into a new session so the dev server outlives this command.
   local launch_pid
   launch_pid="$(
-    python3 - "$REPO_ROOT" "$root/env" "$port" "$root/server.log" <<'PY'
+    python3 - "$REPO_ROOT" "$root/env" "$port" "$root/server.log" "$next_bin" <<'PY'
 import os
 import sys
 
-repo, env_file, port, log_path = sys.argv[1:5]
-env = os.environ.copy()
+repo, env_file, port, log_path, next_bin = sys.argv[1:6]
+# Pass only an allow-listed environment to the dev server (not the full parent environment).
+ALLOWED = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "CI",
+    "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+)
+env = {name: os.environ[name] for name in ALLOWED if name in os.environ}
 with open(env_file, encoding="utf-8") as handle:
     for line in handle:
         line = line.strip()
@@ -206,7 +256,7 @@ os.dup2(log.fileno(), 1)
 os.dup2(log.fileno(), 2)
 devnull = open(os.devnull, "r", encoding="utf-8")
 os.dup2(devnull.fileno(), 0)
-os.execvpe("npx", ["npx", "next", "dev", "-p", port, "-H", "127.0.0.1"], env)
+os.execve(next_bin, [next_bin, "dev", "-p", port, "-H", "127.0.0.1"], env)
 PY
   )"
   echo "$launch_pid" >"$root/server.pid"
@@ -343,6 +393,10 @@ cmd_wallet() {
     echo "wallet requires an email address" >&2
     exit 1
   fi
+  if [[ ! "$email" =~ ^[A-Za-z0-9._%+@-]+$ ]]; then
+    echo "wallet email contains unsupported characters." >&2
+    exit 1
+  fi
   port="$(resolve_port "$port")"
   load_state "$(state_file_for_port "$port")"
   local email_sql="${email//\'/\'\'}"
@@ -385,7 +439,7 @@ cmd_fault() {
   fi
   port="$(resolve_port "$port")"
   load_state "$(state_file_for_port "$port")"
-  if [[ -z "${ROOT:-}" || "$ROOT" != "$STATE_DIR"/run-* ]]; then
+  if ! is_run_root "${ROOT:-}"; then
     echo "Refusing to write a fault file outside a verification run." >&2
     exit 1
   fi
@@ -413,12 +467,15 @@ cmd_quote() {
   done
   port="$(resolve_port "$port")"
   load_state "$(state_file_for_port "$port")"
-  if [[ -z "${ROOT:-}" || "$ROOT" != "$STATE_DIR"/run-* ]]; then
+  if ! is_run_root "${ROOT:-}"; then
     echo "Refusing to touch a quote cache outside a verification run." >&2
     exit 1
   fi
   if [[ "$action" == "clear" ]]; then
-    rm -f "$ROOT/btc-price.json"
+    (
+      cd -- "$ROOT"
+      rm -f -- btc-price.json
+    )
     echo "CLEARED $ROOT/btc-price.json"
     return
   fi
@@ -455,7 +512,7 @@ cmd_cleanup() {
   local files=()
   if [[ "$all" == "1" ]]; then
     shopt -s nullglob
-    files=("$STATE_DIR"/[0-9]*.env)
+    files=("$STATE_DIR"/[0-9]*.state)
     shopt -u nullglob
   else
     port="$(resolve_port "$port")"
@@ -470,9 +527,12 @@ cmd_cleanup() {
   local file
   for file in "${files[@]}"; do
     [[ -f "$file" ]] || continue
-    # shellcheck disable=SC1090
-    source "$file"
+    read_state_file "$file"
     refuse_shared_port "$PORT"
+    if { [[ -n "${PID:-}" ]] && ! valid_pid "$PID"; } || { [[ -n "${PGID:-}" ]] && ! valid_pid "$PGID"; }; then
+      echo "Refusing state file with invalid pid values: $file" >&2
+      exit 1
+    fi
     local listener
     listener="$(port_listener_pid "$PORT")"
     if [[ -n "$listener" && -n "${PID:-}" && "$listener" != "$PID" ]]; then
@@ -509,7 +569,7 @@ cmd_cleanup() {
     else
       echo "Verification server on port $PORT was already stopped"
     fi
-    if [[ -n "${ROOT:-}" && "$ROOT" == "$STATE_DIR"/run-* ]]; then
+    if is_run_root "${ROOT:-}"; then
       rm -rf "$ROOT"
       echo "Removed $ROOT"
     fi
