@@ -24,8 +24,8 @@ Preconditions:
 - For `profile-empty`, the wallet command reports `trades` `0`. For `profile-history`, complete the buy recipe first.
 
 - **Header entry.** Choose `Profile`. Run `node .cursor/skills/verify-tradesim/scripts/drive.mjs --port 4173 click --role link --name "Profile"`. The heading reads `Performance Report`.
-- **Empty history.** With no trades, the page says `Make at least two trades to see your performance chart.` and the history table says `You haven't made any trades yet.` `Total Trades` is `0`.
-- **Stat entry.** From the dashboard, choose the `Total Trades` card. The same report opens.
+- **Empty history.** With no trades, the page says `Make at least two trades to see your performance chart.` The history table says `No trades yet` and `Your buy and sell history will appear here after your first order.` `Total Trades` is `0`.
+- **Stat entry.** From the dashboard, choose the `Total Trades` card. Its accessible name is the title, a newline, and the count. With no trades, run `node .cursor/skills/verify-tradesim/scripts/drive.mjs --port 4173 click --role link --name $'Total Trades\n0'`. The same report opens. A space, as in `Total Trades 0`, does not match.
 - **History after a buy.** After the buy recipe, `Trade History` shows one `BUY` row and `Total Trades` is `1`. The chart message remains, because one trade is not enough to draw it.
 - **Proof.** Capture the report that matches the precondition you used. Run `node .cursor/skills/verify-tradesim/scripts/drive.mjs --port 4173 snapshot --out .cursor/skills/verify-tradesim/artifacts/profile/report.aria.txt` and `node .cursor/skills/verify-tradesim/scripts/drive.mjs --port 4173 screenshot --out .cursor/skills/verify-tradesim/artifacts/profile/report.png`.
 
@@ -35,3 +35,4 @@ Preconditions:
 - Lifetime P&L is about zero after a buy at the current price. Do not require a large profit number.
 - The chart appears only after two trades. One buy still leaves the two-trade message in place.
 - Header `Profile` and the dashboard stat cards are different entry points. Verify the one you claim.
+- The `Total Trades` card's accessible name keeps the newline between the title and the count. After one buy that name is `Total Trades\n1`. Pass the newline with `$'...'`.
