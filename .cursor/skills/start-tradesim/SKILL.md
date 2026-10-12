@@ -22,7 +22,7 @@ From the repo root, check branch, tracking, and working tree.
 git pull --ff-only origin main
 ```
 
-If the pull is not a fast-forward, stop and report the state. Do not merge or rebase.
+If the pull is not a fast-forward, stop and ask the user how they would like to handle it without ending your turn. Do not merge or rebase without permission.
 
 ## Dependencies
 
