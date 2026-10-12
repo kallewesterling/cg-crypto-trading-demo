@@ -40,7 +40,7 @@ npx prisma generate && npx prisma db push
 
 ## Dev server
 
-If something is already listening on port 3000, leave it running and report `http://localhost:3000`. Do not start a second server.
+If something is already listening on port 3000, ask the user whether to exit it, start on a different port, or cancel the start up.
 
 Otherwise start the dev server in the background so it can bind to the port and reach CoinGecko:
 
@@ -57,4 +57,4 @@ The demo is up when both are true:
 - `curl -sf -o /dev/null -w "%{http_code}" http://127.0.0.1:3000` prints `200`
 - The response body contains `Welcome to TradeSim`
 
-Report the commit `main` is on, whether the database was already in sync, and the URL `http://localhost:3000`.
+Report the commit `main` is on, whether the database was already in sync, and the URL.
