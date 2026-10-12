@@ -31,7 +31,7 @@ Preconditions:
 ## Gotchas
 
 - A development-only `Test account` picker appears because the helper sets `DEV_LOGIN=true`. This recipe uses the email and password form. Do not treat the picker as proof of password login.
-- The helper also sets `AUTH_URL` to the verification origin. Without that, `Continue as this account` follows the repo `.env` and leaves this port.
+- The helper also sets `AUTH_URL` to the verification origin. Without that, `Continue as this account` follows the repo's environment file and leaves this port.
 - The picker lists accounts already in this instance's database. An empty database shows `No test accounts are in the local database yet.`
 - Wrong-password and unknown-email failures look the same on the card: a login-failed toast, still on `/login`.
 - The dashboard heading includes the account name. `Welcome Back` on the login card is a different screen.
