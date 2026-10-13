@@ -84,15 +84,17 @@ chainctl iam organizations list -o json | jq -r '.items[].name'
 If it lists more than one, ask the user which organization this project pulls from, and use it as `$ORG`.
 
 ```bash
+mkdir -p /tmp/verify-sources
 chainctl libraries verify --detailed --parent "$ORG" package-lock.json > /tmp/verify-sources/verify.txt 2>&1; echo "exit $?"
 grep 'Status:' /tmp/verify-sources/verify.txt | sort | uniq -c
 ```
 
-Don't read `verify.txt` whole, and don't quote its summary block: it leads with a coverage percentage. Look up a single package with `grep -A3 '<name>@' /tmp/verify-sources/verify.txt`.
+Don't read `verify.txt` whole, and don't quote its summary block: it leads with a coverage percentage. Never put a package name from the lockfile into a shell command. The fixed commands below already list every package that didn't verify.
 
 `Verified as built from source` means a signed Chainguard SLSA attestation checked out. `Not verified` with `is not a Chainguard package` means the package came through the fallback, or it's a platform-specific binary. That's expected and doesn't mean the package is unsafe. The verified count should match the chainguard bucket from step 3. If it's lower, list the Chainguard-built packages that didn't verify and name them in the report instead of chasing them:
 
 ```bash
+mkdir -p /tmp/verify-sources
 awk '/^  - /{p=$2} /Status: Not verified/{print p}' /tmp/verify-sources/verify.txt | sort -u > /tmp/verify-sources/not-verified.txt
 jq -r '.packages | to_entries[] | select((.value.resolved // "") | startswith("https://libraries.cgr.dev/javascript/")) | "\(.key | sub("^.*node_modules/"; ""))@\(.value.version)"' package-lock.json | sort -u | comm -12 - /tmp/verify-sources/not-verified.txt
 ```
